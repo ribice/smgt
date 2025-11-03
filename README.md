@@ -1,4 +1,4 @@
-# smgc toolset
+# s(small) g(o) t(ools)
 
 This repository hosts a handful of single-purpose Go static analysis helpers. Each lives in its own package with a matching CLI under `cmd/`, so you can run only what you need or wire several together.
 
@@ -13,9 +13,9 @@ Each README dives into typical findings, usage, and install commands.
 ## Installation
 
 ```bash
-go install github.com/ribice/smgc/cmd/rot@latest
-go install github.com/ribice/smgc/cmd/set@latest
-go install github.com/ribice/smgc/cmd/loopnow@latest
+go install github.com/ribice/smgt/cmd/rot@latest
+go install github.com/ribice/smgt/cmd/set@latest
+go install github.com/ribice/smgt/cmd/loopnow@latest
 ```
 
 ## Running analyzers
@@ -34,9 +34,9 @@ Want to run several at once? Compose them with [`multichecker`](https://pkg.go.d
 package main
 
 import (
-	"github.com/ribice/smgc/loopnow"
-	"github.com/ribice/smgc/rot"
-	"github.com/ribice/smgc/set"
+	"github.com/ribice/smgt/loopnow"
+	"github.com/ribice/smgt/rot"
+	"github.com/ribice/smgt/set"
 	"golang.org/x/tools/go/analysis/multichecker"
 )
 

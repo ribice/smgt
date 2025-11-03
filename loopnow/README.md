@@ -5,7 +5,7 @@ Warns when `time.Now()` is called inside a loop. Hoisting the call outside avoid
 ## Run it
 
 ```bash
-go install github.com/ribice/smgc/cmd/loopnow@latest
+go install github.com/ribice/smgt/cmd/loopnow@latest
 loopnow ./...
 ```
 

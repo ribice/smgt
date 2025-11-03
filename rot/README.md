@@ -5,7 +5,7 @@ Flags local `var` declarations that are separated from their first real use. Kee
 ## Run it
 
 ```bash
-go install github.com/ribice/smgc/cmd/rot@latest
+go install github.com/ribice/smgt/cmd/rot@latest
 rot ./...
 ```
 

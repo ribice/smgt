@@ -5,7 +5,7 @@ Detects `map[string]bool` values that are only ever written the constant `true`,
 ## Run it
 
 ```bash
-go install github.com/ribice/smgc/cmd/set@latest
+go install github.com/ribice/smgt/cmd/set@latest
 set ./...
 ```
 

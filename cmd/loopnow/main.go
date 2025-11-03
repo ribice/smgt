@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/ribice/smgc/loopnow"
+	"github.com/ribice/smgt/loopnow"
 	"golang.org/x/tools/go/analysis/singlechecker"
 )
 
