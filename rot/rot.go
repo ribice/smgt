@@ -338,6 +338,12 @@ func (cb *contextBuilder) buildBlock(block *ast.BlockStmt, parent *blockCtx, own
 }
 
 func (cb *contextBuilder) processStmt(stmt ast.Stmt, ctx *blockCtx) {
+	infoFor := func(st ast.Stmt) *stmtInfo {
+		if info := cb.stmtInfo[st]; info != nil {
+			return info
+		}
+		return cb.synthInfo[st]
+	}
 	switch s := stmt.(type) {
 	case *ast.LabeledStmt:
 		cb.stmtInfo[s.Stmt] = cb.stmtInfo[stmt]
@@ -346,38 +352,44 @@ func (cb *contextBuilder) processStmt(stmt ast.Stmt, ctx *blockCtx) {
 		cb.buildBlock(s, ctx, stmt)
 	case *ast.IfStmt:
 		if s.Init != nil {
-			owner := cb.stmtInfo[stmt]
-			cb.addSynthetic(s.Init, owner.block, owner.index-1)
+			if owner := infoFor(stmt); owner != nil {
+				cb.addSynthetic(s.Init, owner.block, owner.index-1)
+			}
 		}
 		cb.buildBlock(s.Body, ctx, stmt)
 		cb.buildElse(s.Else, ctx, stmt)
 	case *ast.ForStmt:
 		if s.Init != nil {
-			owner := cb.stmtInfo[stmt]
-			cb.addSynthetic(s.Init, owner.block, owner.index-1)
+			if owner := infoFor(stmt); owner != nil {
+				cb.addSynthetic(s.Init, owner.block, owner.index-1)
+			}
 		}
 		if s.Post != nil {
-			owner := cb.stmtInfo[stmt]
-			cb.addSynthetic(s.Post, owner.block, owner.index)
-			cb.forPost[s.Post] = struct{}{}
+			if owner := infoFor(stmt); owner != nil {
+				cb.addSynthetic(s.Post, owner.block, owner.index)
+				cb.forPost[s.Post] = struct{}{}
+			}
 		}
 		cb.buildBlock(s.Body, ctx, stmt)
 	case *ast.RangeStmt:
 		cb.buildBlock(s.Body, ctx, stmt)
 	case *ast.SwitchStmt:
 		if s.Init != nil {
-			owner := cb.stmtInfo[stmt]
-			cb.addSynthetic(s.Init, owner.block, owner.index-1)
+			if owner := infoFor(stmt); owner != nil {
+				cb.addSynthetic(s.Init, owner.block, owner.index-1)
+			}
 		}
 		cb.buildBlock(s.Body, ctx, stmt)
 	case *ast.TypeSwitchStmt:
 		if s.Init != nil {
-			owner := cb.stmtInfo[stmt]
-			cb.addSynthetic(s.Init, owner.block, owner.index-1)
+			if owner := infoFor(stmt); owner != nil {
+				cb.addSynthetic(s.Init, owner.block, owner.index-1)
+			}
 		}
 		if s.Assign != nil {
-			owner := cb.stmtInfo[stmt]
-			cb.addSynthetic(s.Assign, owner.block, owner.index-1)
+			if owner := infoFor(stmt); owner != nil {
+				cb.addSynthetic(s.Assign, owner.block, owner.index-1)
+			}
 		}
 		cb.buildBlock(s.Body, ctx, stmt)
 	case *ast.SelectStmt:
