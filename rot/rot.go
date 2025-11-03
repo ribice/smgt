@@ -325,6 +325,16 @@ func newContextBuilder() *contextBuilder {
 	}
 }
 
+func (cb *contextBuilder) infoFor(stmt ast.Stmt) *stmtInfo {
+	if stmt == nil {
+		return nil
+	}
+	if info := cb.stmtInfo[stmt]; info != nil {
+		return info
+	}
+	return cb.synthInfo[stmt]
+}
+
 func (cb *contextBuilder) buildBlock(block *ast.BlockStmt, parent *blockCtx, owner ast.Stmt) *blockCtx {
 	if block == nil {
 		return parent
@@ -338,21 +348,15 @@ func (cb *contextBuilder) buildBlock(block *ast.BlockStmt, parent *blockCtx, own
 }
 
 func (cb *contextBuilder) processStmt(stmt ast.Stmt, ctx *blockCtx) {
-	infoFor := func(st ast.Stmt) *stmtInfo {
-		if info := cb.stmtInfo[st]; info != nil {
-			return info
-		}
-		return cb.synthInfo[st]
-	}
 	switch s := stmt.(type) {
 	case *ast.LabeledStmt:
-		cb.stmtInfo[s.Stmt] = cb.stmtInfo[stmt]
+		cb.stmtInfo[s.Stmt] = cb.infoFor(stmt)
 		cb.processStmt(s.Stmt, ctx)
 	case *ast.BlockStmt:
 		cb.buildBlock(s, ctx, stmt)
 	case *ast.IfStmt:
 		if s.Init != nil {
-			if owner := infoFor(stmt); owner != nil {
+			if owner := cb.infoFor(stmt); owner != nil {
 				cb.addSynthetic(s.Init, owner.block, owner.index-1)
 			}
 		}
@@ -360,12 +364,12 @@ func (cb *contextBuilder) processStmt(stmt ast.Stmt, ctx *blockCtx) {
 		cb.buildElse(s.Else, ctx, stmt)
 	case *ast.ForStmt:
 		if s.Init != nil {
-			if owner := infoFor(stmt); owner != nil {
+			if owner := cb.infoFor(stmt); owner != nil {
 				cb.addSynthetic(s.Init, owner.block, owner.index-1)
 			}
 		}
 		if s.Post != nil {
-			if owner := infoFor(stmt); owner != nil {
+			if owner := cb.infoFor(stmt); owner != nil {
 				cb.addSynthetic(s.Post, owner.block, owner.index)
 				cb.forPost[s.Post] = struct{}{}
 			}
@@ -375,19 +379,19 @@ func (cb *contextBuilder) processStmt(stmt ast.Stmt, ctx *blockCtx) {
 		cb.buildBlock(s.Body, ctx, stmt)
 	case *ast.SwitchStmt:
 		if s.Init != nil {
-			if owner := infoFor(stmt); owner != nil {
+			if owner := cb.infoFor(stmt); owner != nil {
 				cb.addSynthetic(s.Init, owner.block, owner.index-1)
 			}
 		}
 		cb.buildBlock(s.Body, ctx, stmt)
 	case *ast.TypeSwitchStmt:
 		if s.Init != nil {
-			if owner := infoFor(stmt); owner != nil {
+			if owner := cb.infoFor(stmt); owner != nil {
 				cb.addSynthetic(s.Init, owner.block, owner.index-1)
 			}
 		}
 		if s.Assign != nil {
-			if owner := infoFor(stmt); owner != nil {
+			if owner := cb.infoFor(stmt); owner != nil {
 				cb.addSynthetic(s.Assign, owner.block, owner.index-1)
 			}
 		}
@@ -406,10 +410,7 @@ func (cb *contextBuilder) buildElse(stmt ast.Stmt, ctx *blockCtx, owner ast.Stmt
 	case *ast.BlockStmt:
 		cb.buildBlock(s, ctx, owner)
 	case *ast.IfStmt:
-		info := cb.stmtInfo[owner]
-		if info == nil {
-			info = cb.synthInfo[owner]
-		}
+		info := cb.infoFor(owner)
 		if info != nil {
 			cb.synthInfo[s] = &stmtInfo{block: info.block, index: info.index}
 		}
