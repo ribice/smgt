@@ -394,6 +394,13 @@ func (cb *contextBuilder) buildElse(stmt ast.Stmt, ctx *blockCtx, owner ast.Stmt
 	case *ast.BlockStmt:
 		cb.buildBlock(s, ctx, owner)
 	case *ast.IfStmt:
+		info := cb.stmtInfo[owner]
+		if info == nil {
+			info = cb.synthInfo[owner]
+		}
+		if info != nil {
+			cb.synthInfo[s] = &stmtInfo{block: info.block, index: info.index}
+		}
 		cb.processStmt(s, ctx)
 	}
 }
