@@ -34,6 +34,7 @@ func run(pass *analysis.Pass) (any, error) {
 type blockCtx struct {
 	parent *blockCtx
 	owner  ast.Stmt
+	stmts  [][]ast.Stmt
 }
 
 type stmtInfo struct {
@@ -46,6 +47,36 @@ type declInfo struct {
 	pos   token.Pos
 	block *blockCtx
 	index int
+}
+
+func (ctx *blockCtx) stmtAt(idx int) ast.Stmt {
+	if ctx == nil || idx < 0 {
+		return nil
+	}
+	if idx >= len(ctx.stmts) {
+		return nil
+	}
+	if len(ctx.stmts[idx]) == 0 {
+		return nil
+	}
+	return ctx.stmts[idx][0]
+}
+
+func (ctx *blockCtx) stmtsInRange(start, end int) []ast.Stmt {
+	if ctx == nil {
+		return nil
+	}
+	if end <= start+1 {
+		return nil
+	}
+	if end > len(ctx.stmts) {
+		return nil
+	}
+	var out []ast.Stmt
+	for i := start + 1; i < end; i++ {
+		out = append(out, ctx.stmts[i]...)
+	}
+	return out
 }
 
 type analyzer struct {
@@ -266,9 +297,15 @@ func (a *analyzer) pathOK(decl *declInfo, stmt ast.Stmt, info *stmtInfo) bool {
 			return false
 		}
 		if block == decl.block {
-			return idx <= decl.index+1
+			if idx <= decl.index+1 {
+				return true
+			}
+			if onlyDeclarationsBetween(block, decl.index, idx) {
+				return true
+			}
+			return false
 		}
-		if idx != 0 {
+		if idx != 0 && !a.allowInnerBlockGap(decl, block) {
 			return false
 		}
 		owner := block.owner
@@ -282,6 +319,59 @@ func (a *analyzer) pathOK(decl *declInfo, stmt ast.Stmt, info *stmtInfo) bool {
 		}
 		block = ownerInfo.block
 		idx = ownerInfo.index
+	}
+}
+
+func (a *analyzer) allowInnerBlockGap(decl *declInfo, block *blockCtx) bool {
+	if decl == nil || decl.block == nil || block == nil {
+		return false
+	}
+	owner := block.owner
+	if owner == nil {
+		return false
+	}
+	switch owner.(type) {
+	case *ast.ForStmt, *ast.RangeStmt:
+		declStmt := decl.block.stmtAt(decl.index)
+		if declStmt == nil {
+			return false
+		}
+		return declStmt != owner
+	default:
+		return false
+	}
+}
+
+func onlyDeclarationsBetween(block *blockCtx, from, to int) bool {
+	if block == nil {
+		return false
+	}
+	if to <= from+1 {
+		return true
+	}
+	if to > len(block.stmts) {
+		return false
+	}
+	for i := from + 1; i < to; i++ {
+		for _, stmt := range block.stmts[i] {
+			if !isDeclarationOrEmpty(stmt) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func isDeclarationOrEmpty(stmt ast.Stmt) bool {
+	switch s := stmt.(type) {
+	case *ast.EmptyStmt:
+		return true
+	case *ast.DeclStmt:
+		return true
+	case *ast.AssignStmt:
+		return s.Tok == token.DEFINE
+	default:
+		return false
 	}
 }
 
@@ -339,8 +429,13 @@ func (cb *contextBuilder) buildBlock(block *ast.BlockStmt, parent *blockCtx, own
 	if block == nil {
 		return parent
 	}
-	ctx := &blockCtx{parent: parent, owner: owner}
+	ctx := &blockCtx{
+		parent: parent,
+		owner:  owner,
+		stmts:  make([][]ast.Stmt, len(block.List)),
+	}
 	for i, stmt := range block.List {
+		ctx.stmts[i] = append(ctx.stmts[i], stmt)
 		cb.stmtInfo[stmt] = &stmtInfo{block: ctx, index: i}
 		cb.processStmt(stmt, ctx)
 	}
@@ -419,22 +514,42 @@ func (cb *contextBuilder) buildElse(stmt ast.Stmt, ctx *blockCtx, owner ast.Stmt
 }
 
 func (cb *contextBuilder) buildClauseBody(clause *ast.CaseClause, parent *blockCtx) {
-	ctx := &blockCtx{parent: parent, owner: clause}
+	ctx := &blockCtx{
+		parent: parent,
+		owner:  clause,
+		stmts:  make([][]ast.Stmt, len(clause.Body)),
+	}
 	cb.caseBlocks[clause] = ctx
 	for i, stmt := range clause.Body {
+		ctx.stmts[i] = append(ctx.stmts[i], stmt)
 		cb.stmtInfo[stmt] = &stmtInfo{block: ctx, index: i}
 		cb.processStmt(stmt, ctx)
 	}
 }
 
 func (cb *contextBuilder) buildCommClause(clause *ast.CommClause, parent *blockCtx) {
-	ctx := &blockCtx{parent: parent, owner: clause}
+	size := len(clause.Body)
+	if clause.Comm != nil && size == 0 {
+		size = 1
+	}
+	ctx := &blockCtx{
+		parent: parent,
+		owner:  clause,
+		stmts:  make([][]ast.Stmt, size),
+	}
 	idx := 0
 	if clause.Comm != nil {
+		if idx < len(ctx.stmts) {
+			ctx.stmts[idx] = append(ctx.stmts[idx], clause.Comm)
+		}
 		cb.stmtInfo[clause.Comm] = &stmtInfo{block: ctx, index: idx}
 		cb.processStmt(clause.Comm, ctx)
 	}
 	for _, stmt := range clause.Body {
+		if idx >= len(ctx.stmts) {
+			ctx.stmts = append(ctx.stmts, nil)
+		}
+		ctx.stmts[idx] = append(ctx.stmts[idx], stmt)
 		cb.stmtInfo[stmt] = &stmtInfo{block: ctx, index: idx}
 		cb.processStmt(stmt, ctx)
 		idx++

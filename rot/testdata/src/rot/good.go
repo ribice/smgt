@@ -130,3 +130,27 @@ func typeSwitchImmediate(v any) string {
 		return ""
 	}
 }
+
+type externalRow struct {
+	ExtID string
+	ID    uint
+}
+
+func mapFromRows(rows []externalRow) map[uint]uint {
+	resolved := make(map[uint]uint, len(rows))
+	ids := make([]uint, 0, len(rows))
+
+	for _, row := range rows {
+		trimmed := strings.TrimSpace(row.ExtID)
+		if trimmed == "" {
+			continue
+		}
+		ids = append(ids, row.ID)
+		resolved[row.ID] = row.ID
+	}
+
+	if len(ids) == 0 {
+		return nil
+	}
+	return resolved
+}
