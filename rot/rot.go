@@ -270,7 +270,7 @@ func (a *analyzer) inspectUses(node ast.Node) {
 		if _, skip := a.forPost[stmt]; skip {
 			return true
 		}
-		if !a.pathOK(decl, stmt, info) {
+		if !a.pathOK(decl, stmt, info, ident) {
 			a.violations[obj] = true
 		}
 		a.seen[obj] = true
@@ -289,7 +289,7 @@ func (a *analyzer) enclosingStmt(node ast.Node) (ast.Stmt, *stmtInfo) {
 	return nil, nil
 }
 
-func (a *analyzer) pathOK(decl *declInfo, stmt ast.Stmt, info *stmtInfo) bool {
+func (a *analyzer) pathOK(decl *declInfo, stmt ast.Stmt, info *stmtInfo, ident *ast.Ident) bool {
 	block := info.block
 	idx := info.index
 	for {
@@ -301,6 +301,11 @@ func (a *analyzer) pathOK(decl *declInfo, stmt ast.Stmt, info *stmtInfo) bool {
 				return true
 			}
 			if a.onlyDeclarationsOrErrorChecksBetween(decl, block, decl.index, idx) {
+				return true
+			}
+			// Special case: if the use is in a composite literal within an assignment,
+			// and all statements between are declarations, allow it
+			if a.isUseInCompositeLiteral(ident, stmt) && onlyDeclarationsBetween(block, decl.index, idx) {
 				return true
 			}
 			return false
@@ -489,6 +494,66 @@ func (a *analyzer) isErrorCheckIf(ifStmt *ast.IfStmt, errObj types.Object) bool 
 		}
 	}
 
+	return false
+}
+
+func (a *analyzer) isUseInCompositeLiteral(ident *ast.Ident, stmt ast.Stmt) bool {
+	// Check if the identifier is used within a composite literal
+	// (struct, slice, array, or map literal) that's part of an assignment statement
+	assignStmt, ok := stmt.(*ast.AssignStmt)
+	if !ok {
+		return false
+	}
+
+	// Walk up from the identifier to find if it's within a composite literal
+	for node := ast.Node(ident); node != nil; {
+		switch n := node.(type) {
+		case *ast.CompositeLit:
+			// Found a composite literal, check if it's part of the assignment
+			// by checking if the composite literal is within the assignment's RHS
+			return a.isCompositeLitInAssign(assignStmt, n)
+		case *ast.AssignStmt:
+			// If we hit an assignment before a composite literal, it's not in a composite literal
+			return false
+		case ast.Stmt:
+			// If we hit a statement, we've gone too far
+			if n == stmt {
+				return false
+			}
+		}
+		// Get parent node
+		parent, exists := a.parents[node]
+		if !exists {
+			break
+		}
+		node = parent
+	}
+
+	return false
+}
+
+func (a *analyzer) isCompositeLitInAssign(assign *ast.AssignStmt, compositeLit ast.Node) bool {
+	// Check if the composite literal is part of the assignment's right-hand side
+	for _, rhs := range assign.Rhs {
+		if a.isNodeWithin(compositeLit, rhs) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *analyzer) isNodeWithin(child, parent ast.Node) bool {
+	// Check if child is within parent's subtree by walking up the parent chain from child
+	for node := child; node != nil; {
+		if node == parent {
+			return true
+		}
+		p, exists := a.parents[node]
+		if !exists {
+			break
+		}
+		node = p
+	}
 	return false
 }
 
