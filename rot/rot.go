@@ -300,7 +300,7 @@ func (a *analyzer) pathOK(decl *declInfo, stmt ast.Stmt, info *stmtInfo) bool {
 			if idx <= decl.index+1 {
 				return true
 			}
-			if onlyDeclarationsBetween(block, decl.index, idx) {
+			if a.onlyDeclarationsOrErrorChecksBetween(decl, block, decl.index, idx) {
 				return true
 			}
 			return false
@@ -340,6 +340,156 @@ func (a *analyzer) allowInnerBlockGap(decl *declInfo, block *blockCtx) bool {
 	default:
 		return false
 	}
+}
+
+func (a *analyzer) onlyDeclarationsOrErrorChecksBetween(decl *declInfo, block *blockCtx, from, to int) bool {
+	if block == nil {
+		return false
+	}
+	if to <= from+1 {
+		return true
+	}
+	if to > len(block.stmts) {
+		return false
+	}
+	for i := from + 1; i < to; i++ {
+		for _, stmt := range block.stmts[i] {
+			if !isDeclarationOrEmpty(stmt) && !a.isErrorCheck(stmt, decl) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (a *analyzer) isErrorCheck(stmt ast.Stmt, decl *declInfo) bool {
+	// Get the declaration statement for the variable we're tracking
+	declStmt := decl.block.stmtAt(decl.index)
+	if declStmt == nil {
+		return false
+	}
+
+	// Check if the declaration statement is an assignment that also declares an error variable
+	var errObj types.Object
+	assignStmt, ok := declStmt.(*ast.AssignStmt)
+	if !ok || assignStmt.Tok != token.DEFINE {
+		return false
+	}
+
+	// Find the error variable declared in the same assignment
+	for _, expr := range assignStmt.Lhs {
+		ident, ok := expr.(*ast.Ident)
+		if !ok {
+			continue
+		}
+		if ident.Name == "err" {
+			obj := a.pass.TypesInfo.Defs[ident]
+			if obj != nil {
+				errObj = obj
+				break
+			}
+		}
+	}
+
+	if errObj == nil {
+		return false
+	}
+
+	// Check if the statement is validating this error
+	switch s := stmt.(type) {
+	case *ast.ExprStmt:
+		// Check for function calls like require.NoError(t, err), assert.NoError(t, err)
+		call, ok := s.X.(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+		return a.isErrorCheckCall(call, errObj)
+	case *ast.IfStmt:
+		// Check for if err != nil { ... }
+		return a.isErrorCheckIf(s, errObj)
+	default:
+		return false
+	}
+}
+
+func (a *analyzer) isErrorCheckCall(call *ast.CallExpr, errObj types.Object) bool {
+	if len(call.Args) == 0 {
+		return false
+	}
+
+	// Check if the last argument is the error variable we're tracking
+	lastArg := call.Args[len(call.Args)-1]
+	ident, ok := lastArg.(*ast.Ident)
+	if !ok {
+		return false
+	}
+
+	obj := a.pass.TypesInfo.ObjectOf(ident)
+	if obj != errObj {
+		return false
+	}
+
+	// Check if it's a known error-checking function
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+
+	selIdent := sel.Sel
+
+	// Common error-checking function names
+	errorCheckNames := map[string]bool{
+		"NoError":     true,
+		"Error":       true,
+		"ErrorIs":     true,
+		"ErrorAs":     true,
+		"Nil":         true,
+		"NotNil":      true,
+		"Fatal":       true,
+		"Fatalf":      true,
+		"FailNow":     true,
+		"Must":        true,
+		"MustNotError": true,
+	}
+
+	return errorCheckNames[selIdent.Name]
+}
+
+func (a *analyzer) isErrorCheckIf(ifStmt *ast.IfStmt, errObj types.Object) bool {
+	// Check if the condition is checking err != nil or err == nil
+	binary, ok := ifStmt.Cond.(*ast.BinaryExpr)
+	if !ok {
+		return false
+	}
+
+	// Check for err != nil or err == nil patterns
+	if binary.Op != token.NEQ && binary.Op != token.EQL {
+		return false
+	}
+
+	// Check if one side is nil and the other is the error variable
+	// nil is a predeclared identifier, so we check by name
+	if ident, ok := binary.X.(*ast.Ident); ok {
+		obj := a.pass.TypesInfo.ObjectOf(ident)
+		if obj == errObj {
+			// Check if the other side is nil
+			if identY, ok := binary.Y.(*ast.Ident); ok && identY.Name == "nil" {
+				return true
+			}
+		}
+	}
+
+	if ident, ok := binary.Y.(*ast.Ident); ok {
+		obj := a.pass.TypesInfo.ObjectOf(ident)
+		if obj == errObj {
+			// Check if the other side is nil
+			if identX, ok := binary.X.(*ast.Ident); ok && identX.Name == "nil" {
+				return true
+			}
+		}
+	}
+
+	return false
 }
 
 func onlyDeclarationsBetween(block *blockCtx, from, to int) bool {
