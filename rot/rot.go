@@ -439,16 +439,16 @@ func (a *analyzer) isErrorCheckCall(call *ast.CallExpr, errObj types.Object) boo
 
 	// Common error-checking function names
 	errorCheckNames := map[string]bool{
-		"NoError":     true,
-		"Error":       true,
-		"ErrorIs":     true,
-		"ErrorAs":     true,
-		"Nil":         true,
-		"NotNil":      true,
-		"Fatal":       true,
-		"Fatalf":      true,
-		"FailNow":     true,
-		"Must":        true,
+		"NoError":      true,
+		"Error":        true,
+		"ErrorIs":      true,
+		"ErrorAs":      true,
+		"Nil":          true,
+		"NotNil":       true,
+		"Fatal":        true,
+		"Fatalf":       true,
+		"FailNow":      true,
+		"Must":         true,
 		"MustNotError": true,
 	}
 
