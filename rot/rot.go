@@ -303,12 +303,22 @@ func (a *analyzer) pathOK(decl *declInfo, stmt ast.Stmt, info *stmtInfo, ident *
 			if a.onlyDeclarationsOrErrorChecksBetween(decl, block, decl.index, idx) {
 				return true
 			}
+			// Special case: if the variable was declared with an error and that error was checked,
+			// allow the variable to be used even with other declarations in between
+			if a.wasValidatedByErrorCheck(decl, block, decl.index, idx) && a.onlyDeclarationsAfterErrorCheck(decl, block, decl.index, idx) {
+				return true
+			}
 			// Special case: if the use is in a composite literal within an assignment,
 			// and all statements between are declarations, allow it
 			if a.isUseInCompositeLiteral(ident, stmt) && onlyDeclarationsBetween(block, decl.index, idx) {
 				return true
 			}
 			return false
+		}
+		// If we're in a nested block, check if the variable was validated by an error check
+		// in the declaration block before entering this nested block
+		if a.wasValidatedByErrorCheckInParent(decl, decl.block, info.block, decl.index) && a.allowInnerBlockGap(decl, block) {
+			return true
 		}
 		if idx != 0 && !a.allowInnerBlockGap(decl, block) {
 			return false
@@ -342,6 +352,9 @@ func (a *analyzer) allowInnerBlockGap(decl *declInfo, block *blockCtx) bool {
 			return false
 		}
 		return declStmt != owner
+	case *ast.IfStmt:
+		// Allow if statements if the variable was validated by an error check
+		return a.wasValidatedByErrorCheckInParent(decl, decl.block, block, decl.index)
 	default:
 		return false
 	}
@@ -362,6 +375,257 @@ func (a *analyzer) onlyDeclarationsOrErrorChecksBetween(decl *declInfo, block *b
 			if !isDeclarationOrEmpty(stmt) && !a.isErrorCheck(stmt, decl) {
 				return false
 			}
+		}
+	}
+	return true
+}
+
+func (a *analyzer) wasValidatedByErrorCheck(decl *declInfo, block *blockCtx, from, to int) bool {
+	// Check if the variable was declared together with an error variable
+	declStmt := block.stmtAt(from)
+	if declStmt == nil {
+		return false
+	}
+
+	assignStmt, ok := declStmt.(*ast.AssignStmt)
+	if !ok || assignStmt.Tok != token.DEFINE {
+		return false
+	}
+
+	// Find the error variable declared in the same assignment
+	var errObj types.Object
+	for _, expr := range assignStmt.Lhs {
+		ident, ok := expr.(*ast.Ident)
+		if !ok {
+			continue
+		}
+		if ident.Name == "err" {
+			obj := a.pass.TypesInfo.Defs[ident]
+			if obj != nil {
+				errObj = obj
+				break
+			}
+		}
+	}
+
+	if errObj == nil {
+		return false
+	}
+
+	// Look for an error check between declaration and use
+	for i := from + 1; i < to; i++ {
+		for _, stmt := range block.stmts[i] {
+			if a.isErrorCheckForVariable(stmt, errObj) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func (a *analyzer) isErrorCheckForVariable(stmt ast.Stmt, errObj types.Object) bool {
+	// Check if the statement is validating the specific error variable
+	switch s := stmt.(type) {
+	case *ast.ExprStmt:
+		call, ok := s.X.(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+		return a.isErrorCheckCallForVariable(call, errObj)
+	case *ast.IfStmt:
+		return a.isErrorCheckIfForVariable(s, errObj)
+	default:
+		return false
+	}
+}
+
+func (a *analyzer) isErrorCheckCallForVariable(call *ast.CallExpr, errObj types.Object) bool {
+	if len(call.Args) == 0 {
+		return false
+	}
+
+	// Check if the last argument is the error variable we're tracking
+	lastArg := call.Args[len(call.Args)-1]
+	ident, ok := lastArg.(*ast.Ident)
+	if !ok {
+		return false
+	}
+
+	obj := a.pass.TypesInfo.ObjectOf(ident)
+	if obj != errObj {
+		return false
+	}
+
+	// Check if it's a known error-checking function
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+
+	selIdent := sel.Sel
+
+	// Common error-checking function names
+	errorCheckNames := map[string]bool{
+		"NoError":      true,
+		"Error":        true,
+		"ErrorIs":      true,
+		"ErrorAs":      true,
+		"Nil":          true,
+		"NotNil":       true,
+		"Fatal":        true,
+		"Fatalf":       true,
+		"FailNow":      true,
+		"Must":         true,
+		"MustNotError": true,
+	}
+
+	return errorCheckNames[selIdent.Name]
+}
+
+func (a *analyzer) isErrorCheckIfForVariable(ifStmt *ast.IfStmt, errObj types.Object) bool {
+	// Check if the condition is checking err != nil or err == nil
+	binary, ok := ifStmt.Cond.(*ast.BinaryExpr)
+	if !ok {
+		return false
+	}
+
+	// Check for err != nil or err == nil patterns
+	if binary.Op != token.NEQ && binary.Op != token.EQL {
+		return false
+	}
+
+	// Check if one side is nil and the other is the error variable
+	// nil is a predeclared identifier, so we check by name
+	if ident, ok := binary.X.(*ast.Ident); ok {
+		obj := a.pass.TypesInfo.ObjectOf(ident)
+		if obj == errObj {
+			// Check if the other side is nil
+			if identY, ok := binary.Y.(*ast.Ident); ok && identY.Name == "nil" {
+				return true
+			}
+		}
+	}
+
+	if ident, ok := binary.Y.(*ast.Ident); ok {
+		obj := a.pass.TypesInfo.ObjectOf(ident)
+		if obj == errObj {
+			// Check if the other side is nil
+			if identX, ok := binary.X.(*ast.Ident); ok && identX.Name == "nil" {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func (a *analyzer) wasValidatedByErrorCheckInParent(decl *declInfo, declBlock, useBlock *blockCtx, declIndex int) bool {
+	// Check if the variable was declared with an error and that error was checked
+	// in the declaration block before entering the nested block where it's used
+	declStmt := declBlock.stmtAt(declIndex)
+	if declStmt == nil {
+		return false
+	}
+
+	assignStmt, ok := declStmt.(*ast.AssignStmt)
+	if !ok || assignStmt.Tok != token.DEFINE {
+		return false
+	}
+
+	// Find the error variable declared in the same assignment
+	var errObj types.Object
+	for _, expr := range assignStmt.Lhs {
+		ident, ok := expr.(*ast.Ident)
+		if !ok {
+			continue
+		}
+		if ident.Name == "err" {
+			obj := a.pass.TypesInfo.Defs[ident]
+			if obj != nil {
+				errObj = obj
+				break
+			}
+		}
+	}
+
+	if errObj == nil {
+		return false
+	}
+
+	// Find the statement that owns the nested block where the variable is used
+	useBlockOwner := useBlock.owner
+	if useBlockOwner == nil {
+		return false
+	}
+
+	ownerInfo := a.contextInfo(useBlockOwner)
+	if ownerInfo == nil || ownerInfo.block != declBlock {
+		return false
+	}
+
+	// Check if there's an error check between the declaration and the nested block
+	ownerIndex := ownerInfo.index
+	for i := declIndex + 1; i <= ownerIndex; i++ {
+		for _, stmt := range declBlock.stmts[i] {
+			if a.isErrorCheckForVariable(stmt, errObj) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+func (a *analyzer) onlyDeclarationsAfterErrorCheck(decl *declInfo, block *blockCtx, from, to int) bool {
+	// Check that all statements between declaration and use are either:
+	// 1. Declarations
+	// 2. Empty statements
+	// 3. Error checks (for the error from the same assignment)
+	// This is used when we know an error was checked, so we allow declarations after the error check
+
+	declStmt := block.stmtAt(from)
+	if declStmt == nil {
+		return false
+	}
+
+	assignStmt, ok := declStmt.(*ast.AssignStmt)
+	if !ok || assignStmt.Tok != token.DEFINE {
+		return false
+	}
+
+	// Find the error variable declared in the same assignment
+	var errObj types.Object
+	for _, expr := range assignStmt.Lhs {
+		ident, ok := expr.(*ast.Ident)
+		if !ok {
+			continue
+		}
+		if ident.Name == "err" {
+			obj := a.pass.TypesInfo.Defs[ident]
+			if obj != nil {
+				errObj = obj
+				break
+			}
+		}
+	}
+
+	if errObj == nil {
+		return false
+	}
+
+	// Check all statements between declaration and use
+	for i := from + 1; i < to; i++ {
+		for _, stmt := range block.stmts[i] {
+			if isDeclarationOrEmpty(stmt) {
+				continue
+			}
+			// Allow error checks for the error from the same assignment
+			if a.isErrorCheckForVariable(stmt, errObj) {
+				continue
+			}
+			// Any other statement is not allowed
+			return false
 		}
 	}
 	return true
