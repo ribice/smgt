@@ -313,11 +313,27 @@ func (a *analyzer) pathOK(decl *declInfo, stmt ast.Stmt, info *stmtInfo, ident *
 			if a.isUseInCompositeLiteral(ident, stmt) && onlyDeclarationsBetween(block, decl.index, idx) {
 				return true
 			}
+			// Special case: if all statements between are declarations or error checks (any error checks),
+			// allow the variable to be used. This handles cases where variables are used after error
+			// validation, even if they weren't declared with an error.
+			if a.onlyDeclarationsOrAnyErrorChecksBetween(block, decl.index, idx) {
+				return true
+			}
+			// Special case: if the variable was declared with an error, check if that error was validated
+			// and all statements between are declarations or error checks
+			if a.wasVariableDeclaredWithError(decl, block) && a.onlyDeclarationsOrAnyErrorChecksBetween(block, decl.index, idx) {
+				return true
+			}
 			return false
 		}
 		// If we're in a nested block, check if the variable was validated by an error check
 		// in the declaration block before entering this nested block
 		if a.wasValidatedByErrorCheckInParent(decl, decl.block, info.block, decl.index) && a.allowInnerBlockGap(decl, block) {
+			return true
+		}
+		// Special case: if we're in a range loop body and the variable is declared in the range,
+		// check if all statements before use in the loop body are declarations or empty
+		if a.isRangeVariableInBody(decl, block, info) {
 			return true
 		}
 		if idx != 0 && !a.allowInnerBlockGap(decl, block) {
@@ -346,7 +362,19 @@ func (a *analyzer) allowInnerBlockGap(decl *declInfo, block *blockCtx) bool {
 		return false
 	}
 	switch owner.(type) {
-	case *ast.ForStmt, *ast.RangeStmt:
+	case *ast.RangeStmt:
+		// For range statements, check if the variable was declared in the range statement
+		declStmt := decl.block.stmtAt(decl.index)
+		if declStmt == nil {
+			return false
+		}
+		// If the declaration is not the range statement itself, use the old logic
+		if declStmt != owner {
+			return declStmt != owner
+		}
+		// For range variables, we'll check in isRangeVariableInBody if they're valid
+		return false
+	case *ast.ForStmt:
 		declStmt := decl.block.stmtAt(decl.index)
 		if declStmt == nil {
 			return false
@@ -378,6 +406,204 @@ func (a *analyzer) onlyDeclarationsOrErrorChecksBetween(decl *declInfo, block *b
 		}
 	}
 	return true
+}
+
+func (a *analyzer) onlyDeclarationsOrAnyErrorChecksBetween(block *blockCtx, from, to int) bool {
+	// Check if all statements between are either declarations or any error checks
+	// This is more lenient than onlyDeclarationsOrErrorChecksBetween - it allows
+	// any error checks, not just ones for the specific variable's error
+	if block == nil {
+		return false
+	}
+	if to <= from+1 {
+		return true
+	}
+	if to > len(block.stmts) {
+		return false
+	}
+	for i := from + 1; i < to; i++ {
+		for _, stmt := range block.stmts[i] {
+			if isDeclarationOrEmpty(stmt) {
+				continue
+			}
+			// Check if it's any error check (not specific to a variable)
+			if a.isAnyErrorCheck(stmt) {
+				continue
+			}
+			return false
+		}
+	}
+	return true
+}
+
+func (a *analyzer) isAnyErrorCheck(stmt ast.Stmt) bool {
+	// Check if the statement is any error check, not specific to a variable
+	switch s := stmt.(type) {
+	case *ast.ExprStmt:
+		call, ok := s.X.(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+		// Check if it's a known error-checking function call
+		if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+			errorCheckNames := map[string]bool{
+				"NoError":      true,
+				"Error":        true,
+				"ErrorIs":      true,
+				"ErrorAs":      true,
+				"Nil":          true,
+				"NotNil":       true,
+				"Fatal":        true,
+				"Fatalf":       true,
+				"FailNow":      true,
+				"Must":         true,
+				"MustNotError": true,
+			}
+			return errorCheckNames[sel.Sel.Name]
+		}
+		return false
+	case *ast.IfStmt:
+		// Check if the condition contains any error check
+		// Also check if the if statement has an init that declares an error variable
+		if s.Init != nil {
+			if assign, ok := s.Init.(*ast.AssignStmt); ok && assign.Tok == token.DEFINE {
+				// Check if any variable declared is named "err"
+				for _, expr := range assign.Lhs {
+					if ident, ok := expr.(*ast.Ident); ok && ident.Name == "err" {
+						return true
+					}
+				}
+			}
+		}
+		return a.containsAnyErrorCheck(s.Cond)
+	default:
+		return false
+	}
+}
+
+func (a *analyzer) containsAnyErrorCheck(expr ast.Expr) bool {
+	// Check if the expression contains any error check (err != nil, etc.)
+	// This is similar to containsErrorCheck but doesn't require a specific error object
+	switch e := expr.(type) {
+	case *ast.BinaryExpr:
+		// Check simple comparisons: err != nil, err == nil
+		if e.Op == token.NEQ || e.Op == token.EQL {
+			if a.isAnyErrorNilComparison(e.X, e.Y) || a.isAnyErrorNilComparison(e.Y, e.X) {
+				return true
+			}
+		}
+		// Check complex expressions recursively
+		return a.containsAnyErrorCheck(e.X) || a.containsAnyErrorCheck(e.Y)
+	case *ast.ParenExpr:
+		return a.containsAnyErrorCheck(e.X)
+	case *ast.CallExpr:
+		// Check if any argument is named "err" (common error variable name)
+		for _, arg := range e.Args {
+			if ident, ok := arg.(*ast.Ident); ok && ident.Name == "err" {
+				return true
+			}
+		}
+		return false
+	case *ast.UnaryExpr:
+		return a.containsAnyErrorCheck(e.X)
+	default:
+		return false
+	}
+}
+
+func (a *analyzer) isAnyErrorNilComparison(expr1, expr2 ast.Expr) bool {
+	// Check if expr1 is an error variable (named "err") and expr2 is nil
+	ident1, ok1 := expr1.(*ast.Ident)
+	ident2, ok2 := expr2.(*ast.Ident)
+
+	if !ok1 || !ok2 {
+		return false
+	}
+
+	// Check if ident1 is named "err" (common error variable name) and ident2 is nil
+	if ident1.Name == "err" && ident2.Name == "nil" {
+		return true
+	}
+
+	return false
+}
+
+func (a *analyzer) wasVariableDeclaredWithError(decl *declInfo, block *blockCtx) bool {
+	// Check if the variable was declared together with an error variable
+	declStmt := block.stmtAt(decl.index)
+	if declStmt == nil {
+		return false
+	}
+
+	assignStmt, ok := declStmt.(*ast.AssignStmt)
+	if !ok || assignStmt.Tok != token.DEFINE {
+		return false
+	}
+
+	// Check if any variable in the assignment is named "err"
+	for _, expr := range assignStmt.Lhs {
+		ident, ok := expr.(*ast.Ident)
+		if !ok {
+			continue
+		}
+		if ident.Name == "err" {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *analyzer) isRangeVariableInBody(decl *declInfo, bodyBlock *blockCtx, useInfo *stmtInfo) bool {
+	// Check if the variable is declared in a range statement and used in its body
+	// Range variables are valid anywhere in the loop body, so just verify:
+	// 1. The variable is declared in a range statement
+	// 2. The use is in the body of that same range statement
+	declStmt := decl.block.stmtAt(decl.index)
+	if declStmt == nil {
+		return false
+	}
+
+	rangeStmt, ok := declStmt.(*ast.RangeStmt)
+	if !ok {
+		return false
+	}
+
+	// Check if the body block is the body of this range statement
+	if bodyBlock.owner != rangeStmt {
+		return false
+	}
+
+	// Range variables are valid anywhere in the loop body
+	return true
+}
+
+func (a *analyzer) stmtUsesOnlyRangeVarsOrNone(stmt ast.Stmt, rangeVars map[types.Object]bool) bool {
+	// Check if the statement uses only range variables or no variables at all
+	var usesNonRangeVar bool
+	ast.Inspect(stmt, func(n ast.Node) bool {
+		ident, ok := n.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		// Skip if it's a definition (declaration)
+		if a.pass.TypesInfo.Defs[ident] != nil {
+			return true
+		}
+		// Skip predeclared identifiers like "nil", "true", "false"
+		if ident.Obj == nil && (ident.Name == "nil" || ident.Name == "true" || ident.Name == "false") {
+			return true
+		}
+		obj := a.pass.TypesInfo.ObjectOf(ident)
+		if obj != nil {
+			if !rangeVars[obj] {
+				usesNonRangeVar = true
+				return false
+			}
+		}
+		return true
+	})
+	// Allow if it uses no variables at all, or only range variables
+	return !usesNonRangeVar
 }
 
 func (a *analyzer) wasValidatedByErrorCheck(decl *declInfo, block *blockCtx, from, to int) bool {
