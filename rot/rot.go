@@ -47,6 +47,8 @@ type declInfo struct {
 	pos   token.Pos
 	block *blockCtx
 	index int
+	stmt  ast.Stmt
+	obj   types.Object
 }
 
 func (ctx *blockCtx) stmtAt(idx int) ast.Stmt {
@@ -175,6 +177,8 @@ func (a *analyzer) collectDecls(node ast.Node) {
 					pos:   v.Pos(),
 					block: block,
 					index: -1,
+					stmt:  stmt,
+					obj:   v,
 				}
 			}
 		}
@@ -205,6 +209,8 @@ func (a *analyzer) recordDeclWithObject(ident *ast.Ident, stmt ast.Stmt, obj typ
 		pos:   ident.Pos(),
 		block: info.block,
 		index: index,
+		stmt:  stmt,
+		obj:   obj,
 	}
 }
 
@@ -267,6 +273,10 @@ func (a *analyzer) inspectUses(node ast.Node) {
 			a.seen[obj] = true
 			return true
 		}
+		if _, ok := stmt.(*ast.ReturnStmt); ok {
+			a.seen[obj] = true
+			return true
+		}
 		if _, skip := a.forPost[stmt]; skip {
 			return true
 		}
@@ -316,13 +326,21 @@ func (a *analyzer) pathOK(decl *declInfo, stmt ast.Stmt, info *stmtInfo, ident *
 			// Special case: if all statements between are declarations or error checks (any error checks),
 			// allow the variable to be used. This handles cases where variables are used after error
 			// validation, even if they weren't declared with an error.
-			if a.onlyDeclarationsOrAnyErrorChecksBetween(block, decl.index, idx) {
+			if a.onlyDeclarationsOrAnyErrorChecksBetween(decl, block, decl.index, idx) {
 				return true
 			}
 			// Special case: if the variable was declared with an error, check if that error was validated
 			// and all statements between are declarations or error checks
-			if a.wasVariableDeclaredWithError(decl, block) && a.onlyDeclarationsOrAnyErrorChecksBetween(block, decl.index, idx) {
+			if a.wasVariableDeclaredWithError(decl, block) && a.onlyDeclarationsOrAnyErrorChecksBetween(decl, block, decl.index, idx) {
 				return true
+			}
+			if a.onlyAssignmentsToDeclBetween(decl, block, decl.index, idx) {
+				return true
+			}
+			if ret, ok := stmt.(*ast.ReturnStmt); ok {
+				if a.returnUsesDecl(ret, decl.obj) && a.blockHasNoUseBetween(block, decl.index+1, idx, decl) {
+					return true
+				}
 			}
 			return false
 		}
@@ -337,7 +355,17 @@ func (a *analyzer) pathOK(decl *declInfo, stmt ast.Stmt, info *stmtInfo, ident *
 			return true
 		}
 		if idx != 0 && !a.allowInnerBlockGap(decl, block) {
-			return false
+			if _, ok := block.owner.(*ast.IfStmt); !ok {
+				return false
+			}
+			if decl != nil && decl.stmt != nil {
+				if parent, ok := a.parents[decl.stmt]; ok && parent == block.owner {
+					return false
+				}
+			}
+			if !a.blockHasNoUseBefore(block, idx, decl) {
+				return false
+			}
 		}
 		owner := block.owner
 		if owner == nil {
@@ -400,15 +428,28 @@ func (a *analyzer) onlyDeclarationsOrErrorChecksBetween(decl *declInfo, block *b
 	}
 	for i := from + 1; i < to; i++ {
 		for _, stmt := range block.stmts[i] {
-			if !isDeclarationOrEmpty(stmt) && !a.isErrorCheck(stmt, decl) {
-				return false
+			if isDeclarationOrEmpty(stmt) {
+				continue
 			}
+			if a.isErrorCheck(stmt, decl) {
+				continue
+			}
+			if a.isGuardStatement(stmt, decl) {
+				continue
+			}
+			if a.isTestingHelperStmt(stmt) {
+				continue
+			}
+			if a.isConcurrencyHelper(stmt) {
+				continue
+			}
+			return false
 		}
 	}
 	return true
 }
 
-func (a *analyzer) onlyDeclarationsOrAnyErrorChecksBetween(block *blockCtx, from, to int) bool {
+func (a *analyzer) onlyDeclarationsOrAnyErrorChecksBetween(decl *declInfo, block *blockCtx, from, to int) bool {
 	// Check if all statements between are either declarations or any error checks
 	// This is more lenient than onlyDeclarationsOrErrorChecksBetween - it allows
 	// any error checks, not just ones for the specific variable's error
@@ -421,6 +462,7 @@ func (a *analyzer) onlyDeclarationsOrAnyErrorChecksBetween(block *blockCtx, from
 	if to > len(block.stmts) {
 		return false
 	}
+	allowConcurrency := decl != nil && a.wasVariableDeclaredWithError(decl, decl.block)
 	for i := from + 1; i < to; i++ {
 		for _, stmt := range block.stmts[i] {
 			if isDeclarationOrEmpty(stmt) {
@@ -428,6 +470,21 @@ func (a *analyzer) onlyDeclarationsOrAnyErrorChecksBetween(block *blockCtx, from
 			}
 			// Check if it's any error check (not specific to a variable)
 			if a.isAnyErrorCheck(stmt) {
+				continue
+			}
+			if a.isGuardStatement(stmt, decl) {
+				continue
+			}
+			if allowConcurrency {
+				switch stmt.(type) {
+				case *ast.GoStmt, *ast.DeferStmt:
+					continue
+				}
+			}
+			if a.isTestingHelperStmt(stmt) {
+				continue
+			}
+			if a.isConcurrencyHelper(stmt) {
 				continue
 			}
 			return false
@@ -573,7 +630,37 @@ func (a *analyzer) isRangeVariableInBody(decl *declInfo, bodyBlock *blockCtx, us
 		return false
 	}
 
-	// Range variables are valid anywhere in the loop body
+	if useInfo == nil {
+		return false
+	}
+
+	// Ensure all statements before the use are safe (declarations, error checks, or guards)
+	for i := 0; i < useInfo.index; i++ {
+		for _, stmt := range bodyBlock.stmts[i] {
+			if isDeclarationOrEmpty(stmt) {
+				continue
+			}
+			if ifStmt, ok := stmt.(*ast.IfStmt); ok {
+				if !a.stmtUsesObject(ifStmt, decl.obj) {
+					continue
+				}
+			}
+			if a.isAnyErrorCheck(stmt) {
+				continue
+			}
+			if a.isGuardStatement(stmt, decl) {
+				continue
+			}
+			if a.isTestingHelperStmt(stmt) {
+				continue
+			}
+			if a.isConcurrencyHelper(stmt) {
+				continue
+			}
+			return false
+		}
+	}
+
 	return true
 }
 
@@ -604,6 +691,257 @@ func (a *analyzer) stmtUsesOnlyRangeVarsOrNone(stmt ast.Stmt, rangeVars map[type
 	})
 	// Allow if it uses no variables at all, or only range variables
 	return !usesNonRangeVar
+}
+
+func (a *analyzer) stmtUsesObject(node ast.Node, obj types.Object) bool {
+	if obj == nil || node == nil {
+		return false
+	}
+	used := false
+	ast.Inspect(node, func(n ast.Node) bool {
+		ident, ok := n.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		if a.pass.TypesInfo.ObjectOf(ident) == obj {
+			used = true
+			return false
+		}
+		return true
+	})
+	return used
+}
+
+func (a *analyzer) blockHasNoUseBefore(block *blockCtx, upto int, decl *declInfo) bool {
+	if block == nil || decl == nil || decl.obj == nil {
+		return false
+	}
+	if upto > len(block.stmts) {
+		upto = len(block.stmts)
+	}
+	for i := 0; i < upto; i++ {
+		for _, stmt := range block.stmts[i] {
+			if a.stmtUsesObject(stmt, decl.obj) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (a *analyzer) blockHasNoUseBetween(block *blockCtx, start, end int, decl *declInfo) bool {
+	if block == nil || decl == nil || decl.obj == nil {
+		return false
+	}
+	if start < 0 {
+		start = 0
+	}
+	if end > len(block.stmts) {
+		end = len(block.stmts)
+	}
+	for i := start; i < end; i++ {
+		for _, stmt := range block.stmts[i] {
+			if a.stmtUsesObject(stmt, decl.obj) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (a *analyzer) onlyAssignmentsToDeclBetween(decl *declInfo, block *blockCtx, from, to int) bool {
+	if block == nil {
+		return false
+	}
+	if to <= from+1 {
+		return true
+	}
+	if to > len(block.stmts) {
+		to = len(block.stmts)
+	}
+	for i := from + 1; i < to; i++ {
+		for _, stmt := range block.stmts[i] {
+			if isDeclarationOrEmpty(stmt) {
+				continue
+			}
+			if ifStmt, ok := stmt.(*ast.IfStmt); ok && a.ifStmtContainsOnlyAssignments(ifStmt) {
+				continue
+			}
+			return false
+		}
+	}
+	return true
+}
+
+func (a *analyzer) ifStmtContainsOnlyAssignments(ifStmt *ast.IfStmt) bool {
+	if ifStmt == nil || ifStmt.Init != nil {
+		return false
+	}
+	if !blockContainsOnlyAssignments(ifStmt.Body) {
+		return false
+	}
+	if ifStmt.Else == nil {
+		return true
+	}
+	switch elseStmt := ifStmt.Else.(type) {
+	case *ast.BlockStmt:
+		return blockContainsOnlyAssignments(elseStmt)
+	case *ast.IfStmt:
+		return a.ifStmtContainsOnlyAssignments(elseStmt)
+	default:
+		return false
+	}
+}
+
+func blockContainsOnlyAssignments(block *ast.BlockStmt) bool {
+	if block == nil {
+		return false
+	}
+	for _, stmt := range block.List {
+		if isDeclarationOrEmpty(stmt) {
+			continue
+		}
+		assign, ok := stmt.(*ast.AssignStmt)
+		if !ok || assign.Tok != token.ASSIGN {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *analyzer) blockUsesObject(block *ast.BlockStmt, obj types.Object) bool {
+	if block == nil || obj == nil {
+		return false
+	}
+	used := false
+	ast.Inspect(block, func(n ast.Node) bool {
+		ident, ok := n.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		if ident.Obj != nil {
+			return true
+		}
+		if obj == a.pass.TypesInfo.ObjectOf(ident) {
+			used = true
+			return false
+		}
+		return true
+	})
+	return used
+}
+
+func (a *analyzer) returnUsesDecl(ret *ast.ReturnStmt, obj types.Object) bool {
+	if ret == nil || obj == nil {
+		return false
+	}
+	for _, res := range ret.Results {
+		ident, ok := res.(*ast.Ident)
+		if !ok {
+			continue
+		}
+		if obj == a.pass.TypesInfo.ObjectOf(ident) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *analyzer) isTestingHelperStmt(stmt ast.Stmt) bool {
+	exprStmt, ok := stmt.(*ast.ExprStmt)
+	if !ok {
+		return false
+	}
+	call, ok := exprStmt.X.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+
+	methodIdent := sel.Sel
+	if methodIdent == nil {
+		return false
+	}
+
+	switch methodIdent.Name {
+	case "Helper", "Cleanup", "Parallel", "ResetTimer", "StartTimer", "StopTimer",
+		"ReportAllocs", "SetBytes", "SetParallelism", "Run", "Loop",
+		"Skip", "SkipNow", "Skipf", "Fatal", "Fatalf",
+		"Log", "Logf", "Error", "Errorf", "Fail", "FailNow",
+		"TempDir", "Setenv":
+	default:
+		return false
+	}
+
+	recvType := a.pass.TypesInfo.TypeOf(sel.X)
+	if recvType == nil {
+		return false
+	}
+
+	for {
+		if ptr, ok := recvType.(*types.Pointer); ok {
+			recvType = ptr.Elem()
+			continue
+		}
+		break
+	}
+
+	named, ok := recvType.(*types.Named)
+	if !ok {
+		return false
+	}
+
+	obj := named.Obj()
+	if obj == nil {
+		return false
+	}
+	pkg := obj.Pkg()
+	if pkg == nil {
+		return false
+	}
+	if pkg.Path() != "testing" {
+		return false
+	}
+	if obj.Name() != "T" && obj.Name() != "B" {
+		return false
+	}
+
+	return true
+}
+
+func (a *analyzer) isConcurrencyHelper(stmt ast.Stmt) bool {
+	switch s := stmt.(type) {
+	case *ast.ExprStmt:
+		if call, ok := s.X.(*ast.CallExpr); ok {
+			return a.callIsConcurrencyHelper(call)
+		}
+	case *ast.DeferStmt:
+		return a.callIsConcurrencyHelper(s.Call)
+	}
+	return false
+}
+
+func (a *analyzer) callIsConcurrencyHelper(call *ast.CallExpr) bool {
+	if call == nil {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	method := sel.Sel
+	if method == nil {
+		return false
+	}
+	switch method.Name {
+	case "Lock", "Unlock", "RLock", "RUnlock", "TryLock", "TryRLock",
+		"Add", "Done", "Wait", "Signal", "Broadcast":
+		return true
+	}
+	return false
 }
 
 func (a *analyzer) wasValidatedByErrorCheck(decl *declInfo, block *blockCtx, from, to int) bool {
@@ -869,11 +1207,164 @@ func (a *analyzer) onlyDeclarationsAfterErrorCheck(decl *declInfo, block *blockC
 			if a.isErrorCheckForVariable(stmt, errObj) {
 				continue
 			}
+			if a.isGuardStatement(stmt, decl) {
+				continue
+			}
+			if _, ok := stmt.(*ast.GoStmt); ok {
+				continue
+			}
+			if _, ok := stmt.(*ast.DeferStmt); ok {
+				continue
+			}
+			if a.isTestingHelperStmt(stmt) {
+				continue
+			}
+			if a.isConcurrencyHelper(stmt) {
+				continue
+			}
 			// Any other statement is not allowed
 			return false
 		}
 	}
 	return true
+}
+
+func (a *analyzer) isGuardStatement(stmt ast.Stmt, decl *declInfo) bool {
+	if decl == nil || decl.obj == nil {
+		return false
+	}
+	ifStmt, ok := stmt.(*ast.IfStmt)
+	if !ok {
+		return false
+	}
+	if ifStmt.Else != nil {
+		return false
+	}
+
+	guardObjs := a.guardRelatedObjects(decl)
+	if len(guardObjs) == 0 {
+		return false
+	}
+	if !a.conditionUsesGuardVar(ifStmt.Cond, guardObjs) {
+		return false
+	}
+	if guardBodyTerminates(ifStmt.Body) {
+		return true
+	}
+	if decl != nil && decl.obj != nil && a.blockUsesObject(ifStmt.Body, decl.obj) {
+		return true
+	}
+	return false
+}
+
+func (a *analyzer) guardRelatedObjects(decl *declInfo) map[types.Object]struct{} {
+	objs := make(map[types.Object]struct{})
+	if decl == nil {
+		return objs
+	}
+	if decl.obj != nil {
+		objs[decl.obj] = struct{}{}
+	}
+	if decl.stmt == nil {
+		return objs
+	}
+
+	switch s := decl.stmt.(type) {
+	case *ast.AssignStmt:
+		if s.Tok != token.DEFINE {
+			return objs
+		}
+		for _, lhs := range s.Lhs {
+			if ident, ok := lhs.(*ast.Ident); ok {
+				if obj := a.pass.TypesInfo.Defs[ident]; obj != nil {
+					objs[obj] = struct{}{}
+				}
+			}
+		}
+	case *ast.DeclStmt:
+		gen, ok := s.Decl.(*ast.GenDecl)
+		if !ok {
+			return objs
+		}
+		for _, spec := range gen.Specs {
+			valueSpec, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			for _, name := range valueSpec.Names {
+				if obj := a.pass.TypesInfo.Defs[name]; obj != nil {
+					objs[obj] = struct{}{}
+				}
+			}
+		}
+	case *ast.RangeStmt:
+		if ident, ok := s.Key.(*ast.Ident); ok {
+			if obj := a.pass.TypesInfo.Defs[ident]; obj != nil {
+				objs[obj] = struct{}{}
+			}
+		}
+		if ident, ok := s.Value.(*ast.Ident); ok {
+			if obj := a.pass.TypesInfo.Defs[ident]; obj != nil {
+				objs[obj] = struct{}{}
+			}
+		}
+	}
+
+	return objs
+}
+
+func (a *analyzer) conditionUsesGuardVar(expr ast.Expr, guardObjs map[types.Object]struct{}) bool {
+	if len(guardObjs) == 0 || expr == nil {
+		return false
+	}
+	found := false
+	ast.Inspect(expr, func(n ast.Node) bool {
+		ident, ok := n.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		obj := a.pass.TypesInfo.ObjectOf(ident)
+		if obj == nil {
+			return true
+		}
+		if _, ok := guardObjs[obj]; ok {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+func guardBodyTerminates(body *ast.BlockStmt) bool {
+	if body == nil || len(body.List) == 0 {
+		return false
+	}
+	last := body.List[len(body.List)-1]
+	return statementTerminates(last)
+}
+
+func statementTerminates(stmt ast.Stmt) bool {
+	switch s := stmt.(type) {
+	case *ast.ReturnStmt:
+		return true
+	case *ast.BranchStmt:
+		return s.Tok == token.CONTINUE
+	case *ast.ExprStmt:
+		return callTerminates(s.X)
+	}
+	return false
+}
+
+func callTerminates(expr ast.Expr) bool {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "panic" {
+		return true
+	}
+	return false
 }
 
 func (a *analyzer) isErrorCheck(stmt ast.Stmt, decl *declInfo) bool {

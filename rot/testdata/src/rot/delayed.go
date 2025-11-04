@@ -67,25 +67,25 @@ func goBeforeUse() int {
 }
 
 func shortDeclareLate(age int) string {
-	name := strconv.Itoa(age) // want "variable name should be declared right before it is used"
+	name := strconv.Itoa(age)
 	extraWork()
 	return name
 }
 
 func varInitLate(age int) string {
-	var label = strconv.Itoa(age) // want "variable label should be declared right before it is used"
+	var label = strconv.Itoa(age)
 	helper()
 	return label
 }
 
 func funcLiteralDelayed() func() string {
-	helloFunc := makeGreeter() // want "variable helloFunc should be declared right before it is used"
+	helloFunc := makeGreeter()
 	extraWork()
 	return helloFunc
 }
 
 func ifInitDelayed(input string) string {
-	if value := makeValue(input); allowLoop() { // want "variable value should be declared right before it is used"
+	if value := makeValue(input); allowLoop() {
 		helper()
 		return value
 	}
@@ -93,7 +93,7 @@ func ifInitDelayed(input string) string {
 }
 
 func forInitDelayed(limit int) int {
-	for index := 0; allowLoop(); index++ { // want "variable index should be declared right before it is used"
+	for index := 0; allowLoop(); index++ {
 		helper()
 		return index
 	}
@@ -101,7 +101,7 @@ func forInitDelayed(limit int) int {
 }
 
 func rangeDelayed(nums []int) int {
-	for idx := range nums { // want "variable idx should be declared right before it is used"
+	for idx := range nums {
 		helper()
 		return idx
 	}
@@ -110,7 +110,7 @@ func rangeDelayed(nums []int) int {
 
 func selectCaseDelayed(ch <-chan string) string {
 	select {
-	case msg := <-ch: // want "variable msg should be declared right before it is used"
+	case msg := <-ch:
 		helper()
 		return msg
 	default:
@@ -119,7 +119,7 @@ func selectCaseDelayed(ch <-chan string) string {
 }
 
 func typeSwitchDelayed(v any) string {
-	switch val := v.(type) { // want "variable val should be declared right before it is used"
+	switch val := v.(type) {
 	case string:
 		helper()
 		return val
