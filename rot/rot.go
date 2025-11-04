@@ -484,37 +484,56 @@ func (a *analyzer) isErrorCheckCallForVariable(call *ast.CallExpr, errObj types.
 }
 
 func (a *analyzer) isErrorCheckIfForVariable(ifStmt *ast.IfStmt, errObj types.Object) bool {
-	// Check if the condition is checking err != nil or err == nil
-	binary, ok := ifStmt.Cond.(*ast.BinaryExpr)
-	if !ok {
-		return false
-	}
+	// Check if the condition contains an error check for the error variable
+	return a.containsErrorCheck(ifStmt.Cond, errObj)
+}
 
-	// Check for err != nil or err == nil patterns
-	if binary.Op != token.NEQ && binary.Op != token.EQL {
-		return false
-	}
-
-	// Check if one side is nil and the other is the error variable
-	// nil is a predeclared identifier, so we check by name
-	if ident, ok := binary.X.(*ast.Ident); ok {
-		obj := a.pass.TypesInfo.ObjectOf(ident)
-		if obj == errObj {
-			// Check if the other side is nil
-			if identY, ok := binary.Y.(*ast.Ident); ok && identY.Name == "nil" {
+func (a *analyzer) containsErrorCheck(expr ast.Expr, errObj types.Object) bool {
+	// Recursively check if the expression contains an error check for errObj
+	switch e := expr.(type) {
+	case *ast.BinaryExpr:
+		// Check simple comparisons: err != nil, err == nil
+		if e.Op == token.NEQ || e.Op == token.EQL {
+			if a.isErrorNilComparison(e.X, e.Y, errObj) || a.isErrorNilComparison(e.Y, e.X, errObj) {
 				return true
 			}
 		}
-	}
-
-	if ident, ok := binary.Y.(*ast.Ident); ok {
-		obj := a.pass.TypesInfo.ObjectOf(ident)
-		if obj == errObj {
-			// Check if the other side is nil
-			if identX, ok := binary.X.(*ast.Ident); ok && identX.Name == "nil" {
-				return true
+		// Check complex expressions: (err != nil) != wantErr, err != nil && ...
+		return a.containsErrorCheck(e.X, errObj) || a.containsErrorCheck(e.Y, errObj)
+	case *ast.ParenExpr:
+		// Handle parentheses: (err != nil)
+		return a.containsErrorCheck(e.X, errObj)
+	case *ast.CallExpr:
+		// Check if it's a function call that checks the error
+		for _, arg := range e.Args {
+			if ident, ok := arg.(*ast.Ident); ok {
+				if obj := a.pass.TypesInfo.ObjectOf(ident); obj == errObj {
+					// The error is being passed to a function (likely an error check function)
+					return true
+				}
 			}
 		}
+		return false
+	case *ast.UnaryExpr:
+		// Handle unary expressions like !(err != nil)
+		return a.containsErrorCheck(e.X, errObj)
+	default:
+		return false
+	}
+}
+
+func (a *analyzer) isErrorNilComparison(expr1, expr2 ast.Expr, errObj types.Object) bool {
+	// Check if expr1 is the error variable and expr2 is nil
+	ident1, ok1 := expr1.(*ast.Ident)
+	ident2, ok2 := expr2.(*ast.Ident)
+
+	if !ok1 || !ok2 {
+		return false
+	}
+
+	obj1 := a.pass.TypesInfo.ObjectOf(ident1)
+	if obj1 == errObj && ident2.Name == "nil" {
+		return true
 	}
 
 	return false
